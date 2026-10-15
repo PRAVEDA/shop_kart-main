@@ -28,4 +28,3 @@ frontend/dist/
 backend/.env
 *.log
 .gitignore
-*.gitignore
