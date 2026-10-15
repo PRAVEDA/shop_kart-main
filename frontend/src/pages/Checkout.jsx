@@ -1,0 +1,771 @@
+import React, { useState, useEffect } from "react";
+import { useNavigate, Link } from "react-router-dom";
+import { ShieldCheck, ArrowLeft, ShoppingBag, CreditCard, AlertCircle, CheckCircle2, Lock, Zap } from "lucide-react";
+import CheckoutForm from "../components/CheckoutForm";
+import { useCart } from "../context/CartContext";
+import { createPaymentOrder, verifyPayment, getTestSignature } from "../services/api";
+
+const loadRazorpayScript = () => {
+  return new Promise((resolve) => {
+    if (window.Razorpay) {
+      resolve(true);
+      return;
+    }
+    const script = document.createElement("script");
+    script.src = "https://checkout.razorpay.com/v1/checkout.js";
+    script.async = true;
+    script.onload = () => resolve(true);
+    script.onerror = () => resolve(false);
+    document.body.appendChild(script);
+  });
+};
+
+const Checkout = ({ user }) => {
+  const navigate = useNavigate();
+  const { cart, subtotal, totalUnits, clearCart } = useCart();
+
+  const [formData, setFormData] = useState({
+    fullName: "",
+    phone: "",
+    addressLine1: "",
+    city: "",
+    state: "",
+    pincode: "",
+  });
+
+  const [errors, setErrors] = useState({});
+  const [submitting, setSubmitting] = useState(false);
+  const [verifying, setVerifying] = useState(false);
+  const [serverError, setServerError] = useState("");
+  const [activePaymentOrder, setActivePaymentOrder] = useState(null);
+  const [showTestModal, setShowTestModal] = useState(false);
+  const [canSimulatePayment, setCanSimulatePayment] = useState(false);
+
+  // Pre-load Razorpay script on mount
+  useEffect(() => {
+    loadRazorpayScript();
+  }, []);
+
+  useEffect(() => {
+    if (!user) return;
+    const digits = String(user.phone || "").replace(/\D/g, "").slice(-10);
+    setFormData((prev) => ({
+      ...prev,
+      fullName: prev.fullName || user.fullName || "",
+      phone: prev.phone || digits,
+    }));
+  }, [user]);
+
+  // Form Validation (Task 3)
+  const validateForm = () => {
+    const errs = {};
+    if (!formData.fullName.trim()) errs.fullName = "Full name is required";
+    if (!formData.phone.trim()) {
+      errs.phone = "Phone number is required";
+    } else if (!/^[6-9][0-9]{9}$/.test(formData.phone.trim())) {
+      errs.phone = "Enter a valid 10-digit Indian mobile number";
+    }
+
+    if (!formData.addressLine1.trim()) errs.addressLine1 = "Street address is required";
+    if (!formData.city.trim()) errs.city = "City is required";
+    if (!formData.state.trim()) errs.state = "State is required";
+    if (!formData.pincode.trim()) {
+      errs.pincode = "Pincode is required";
+    } else if (!/^[0-9]{6}$/.test(formData.pincode.trim())) {
+      errs.pincode = "Pincode must be exactly 6 digits";
+    }
+
+    setErrors(errs);
+    return Object.keys(errs).length === 0;
+  };
+
+  // Complete Payment Verification Flow (Step 11 & 13)
+  const handlePaymentSuccess = async (paymentDetails) => {
+    setVerifying(true);
+    setServerError("");
+    setCanSimulatePayment(false);
+    try {
+      const verifyRes = await verifyPayment(paymentDetails);
+      if (verifyRes.success) {
+        // Clear global cart state and Navbar count immediately
+        clearCart();
+        // Navigate to Order Confirmation / Details page
+        navigate(`/orders/${paymentDetails.shopKartOrderId}`, {
+          state: {
+            orderSuccess: true,
+            order: verifyRes.order,
+          },
+        });
+      }
+    } catch (err) {
+      console.error("Payment verification error:", err);
+      const msg = err.response?.data?.message || "Payment verification failed. Your cart was not cleared.";
+      setServerError(msg);
+    } finally {
+      setVerifying(false);
+      setSubmitting(false);
+      setShowTestModal(false);
+    }
+  };
+
+  // Step 7, 8, 9, 10: Checkout & Razorpay Submission
+  const handleCheckoutSubmit = async (e) => {
+    e.preventDefault();
+    setServerError("");
+
+    if (!validateForm()) {
+      return;
+    }
+
+    if (!cart || cart.length === 0) {
+      setServerError("Your cart is empty. Add products before checking out.");
+      return;
+    }
+
+    setSubmitting(true);
+    try {
+      // 1. Create order on backend (revalidates prices & stock, calculates server total)
+      const orderData = await createPaymentOrder(formData);
+
+      if (!orderData.success) {
+        throw new Error(orderData.message || "Failed to create payment order");
+      }
+
+      setActivePaymentOrder(orderData);
+      setCanSimulatePayment(orderData.allowTestSimulation === true);
+
+      if (orderData.paymentMode === "simulated") {
+        // Open Test Mode Simulator Dialog directly
+        setShowTestModal(true);
+        setSubmitting(false);
+        return;
+      }
+
+      // Load Razorpay script for live/registered test keys
+      const scriptLoaded = await loadRazorpayScript();
+
+      if (!scriptLoaded || !window.Razorpay) {
+        if (orderData.allowTestSimulation) {
+          setServerError("Razorpay Checkout could not be loaded. You can finish this order with the test simulator.");
+          setShowTestModal(true);
+        } else {
+          setServerError("Razorpay Checkout could not be loaded. Check your connection and try again.");
+        }
+        setSubmitting(false);
+        return;
+      }
+
+      // Open Razorpay Standard Checkout
+      const options = {
+        key: orderData.key,
+        amount: Number(orderData.amount),
+        currency: orderData.currency || "INR",
+        name: "ShopKart",
+        description: "Secure Order Checkout",
+        order_id: orderData.razorpayOrderId,
+        handler: async function (response) {
+          await handlePaymentSuccess({
+            shopKartOrderId: orderData.shopKartOrderId,
+            razorpay_order_id: response.razorpay_order_id,
+            razorpay_payment_id: response.razorpay_payment_id,
+            razorpay_signature: response.razorpay_signature,
+          });
+        },
+        prefill: {
+          name: formData.fullName,
+          email: orderData.customerEmail || user?.email || "customer@shopkart.test",
+          contact: `+91${formData.phone.trim()}`,
+        },
+        notes: {
+          shopKartOrderId: String(orderData.shopKartOrderId),
+        },
+        retry: {
+          enabled: true,
+          max_count: 3,
+        },
+        theme: {
+          color: "#6366f1",
+        },
+        modal: {
+          ondismiss: function () {
+            setSubmitting(false);
+          },
+        },
+      };
+
+      try {
+        const rzp = new window.Razorpay(options);
+        rzp.on("payment.failed", function (response) {
+          console.error("Razorpay payment failed:", response.error);
+          const description = response.error?.description || "Your payment could not be processed";
+          setServerError(`Payment Failed: ${description}. Your cart has not been cleared.`);
+          setSubmitting(false);
+          if (orderData.allowTestSimulation) {
+            setShowTestModal(true);
+          }
+        });
+        rzp.open();
+      } catch (err) {
+        console.error("Razorpay checkout could not be opened:", err);
+        if (orderData.allowTestSimulation) {
+          setServerError("Razorpay Checkout could not be opened. You can finish this order with the test simulator.");
+          setShowTestModal(true);
+        } else {
+          setServerError("Razorpay Checkout could not be opened. Please try again.");
+        }
+        setSubmitting(false);
+      }
+    } catch (err) {
+      console.error("Checkout initiation error:", err);
+      const msg = err.response?.data?.message || err.message || "Error processing checkout";
+      setServerError(msg);
+      setSubmitting(false);
+    }
+  };
+
+  // Test Mode Simulator: Simulate successful payment
+  const handleSimulateSuccess = async () => {
+    if (!activePaymentOrder) return;
+    setVerifying(true);
+    try {
+      const mockPaymentId = `pay_test_${Date.now()}`;
+      // Request signed HMAC from server helper
+      const sigData = await getTestSignature(activePaymentOrder.razorpayOrderId, mockPaymentId);
+
+      await handlePaymentSuccess({
+        shopKartOrderId: activePaymentOrder.shopKartOrderId,
+        razorpay_order_id: activePaymentOrder.razorpayOrderId,
+        razorpay_payment_id: mockPaymentId,
+        razorpay_signature: sigData.signature,
+      });
+    } catch (err) {
+      setServerError(err.response?.data?.message || "Simulated payment verification failed");
+      setVerifying(false);
+      setShowTestModal(false);
+    }
+  };
+
+  // Test Mode Simulator: Simulate failed payment
+  const handleSimulateFailure = () => {
+    setServerError("Simulated Payment Declined by user or issuing bank. Your cart has not been cleared.");
+    setShowTestModal(false);
+    setSubmitting(false);
+  };
+
+  // If cart is empty and no active verification
+  if ((!cart || cart.length === 0) && !verifying) {
+    return (
+      <div className="page-wrapper">
+        <div
+          style={{
+            textAlign: "center",
+            padding: "3rem 2rem",
+            background: "rgba(17, 24, 39, 0.7)",
+            border: "1px solid var(--border-subtle)",
+            borderRadius: "16px",
+            maxWidth: "480px",
+            margin: "4rem auto",
+          }}
+        >
+          <div
+            style={{
+              width: "64px",
+              height: "64px",
+              borderRadius: "50%",
+              background: "rgba(99, 102, 241, 0.1)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              margin: "0 auto 1.5rem",
+            }}
+          >
+            <ShoppingBag size={32} color="#818cf8" />
+          </div>
+          <h2 style={{ fontSize: "1.5rem", fontWeight: 700, marginBottom: "0.5rem" }}>
+            Your Cart is Empty
+          </h2>
+          <p style={{ color: "var(--text-muted)", fontSize: "0.95rem", marginBottom: "2rem" }}>
+            You need to add products to your cart before proceeding to checkout.
+          </p>
+          <Link
+            to="/products"
+            className="btn-primary"
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: "0.5rem",
+              textDecoration: "none",
+              padding: "0.8rem 1.8rem",
+            }}
+          >
+            <ArrowLeft size={18} />
+            Browse Products
+          </Link>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="page-wrapper" style={{ alignItems: "flex-start", padding: "2.5rem 1rem" }}>
+      <div className="container" style={{ maxWidth: "1160px", margin: "0 auto", width: "100%" }}>
+        {/* Navigation Breadcrumb */}
+        <div style={{ marginBottom: "1.5rem" }}>
+          <Link
+            to="/cart"
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: "0.4rem",
+              color: "var(--text-muted)",
+              textDecoration: "none",
+              fontSize: "0.875rem",
+              fontWeight: 500,
+              transition: "color 0.2s",
+            }}
+          >
+            <ArrowLeft size={16} />
+            Back to Cart
+          </Link>
+        </div>
+
+        {/* Page Title & Badges */}
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: "1rem", marginBottom: "2rem" }}>
+          <div>
+            <h1 style={{ fontSize: "2rem", fontWeight: 800, letterSpacing: "-0.03em", color: "var(--text-main)", marginBottom: "0.3rem" }}>
+              Checkout
+            </h1>
+            <p style={{ color: "var(--text-muted)", fontSize: "0.95rem" }}>
+              Complete your delivery address and pay securely with Razorpay.
+            </p>
+          </div>
+          <div
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: "0.5rem",
+              padding: "0.4rem 0.9rem",
+              borderRadius: "20px",
+              background: "rgba(99, 102, 241, 0.12)",
+              border: "1px solid rgba(99, 102, 241, 0.25)",
+              color: "#818cf8",
+              fontSize: "0.85rem",
+              fontWeight: 600,
+            }}
+          >
+            <Zap size={15} />
+            Razorpay Test Mode
+          </div>
+        </div>
+
+        {/* Server Error Message */}
+        {serverError && (
+          <div
+            style={{
+              padding: "1rem 1.25rem",
+              background: "rgba(239, 68, 68, 0.1)",
+              border: "1px solid rgba(239, 68, 68, 0.25)",
+              borderRadius: "12px",
+              color: "#f87171",
+              fontSize: "0.9rem",
+              marginBottom: "1.5rem",
+              display: "flex",
+              alignItems: "center",
+              gap: "0.75rem",
+            }}
+          >
+            <AlertCircle size={20} style={{ flexShrink: 0 }} />
+            <span>{serverError}</span>
+            {canSimulatePayment && activePaymentOrder && (
+              <button
+                type="button"
+                className="btn-outline"
+                onClick={() => {
+                  setServerError("");
+                  setShowTestModal(true);
+                }}
+                style={{ flexShrink: 0 }}
+              >
+                <Zap size={15} />
+                <span>Use test simulator</span>
+              </button>
+            )}
+          </div>
+        )}
+
+        {/* Main 2-Column Grid */}
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "1.2fr 1fr",
+            gap: "2rem",
+            alignItems: "start",
+          }}
+        >
+          {/* Left Column: Shipping Form */}
+          <form id="checkout-form" onSubmit={handleCheckoutSubmit}>
+            <CheckoutForm
+              formData={formData}
+              setFormData={setFormData}
+              errors={errors}
+              disabled={submitting || verifying}
+            />
+          </form>
+
+          {/* Right Column: Order Review & Payment CTA */}
+          <div
+            style={{
+              background: "rgba(17, 24, 39, 0.7)",
+              backdropFilter: "blur(12px)",
+              WebkitBackdropFilter: "blur(12px)",
+              border: "1px solid var(--border-subtle)",
+              borderRadius: "16px",
+              padding: "2rem",
+              boxShadow: "0 8px 32px rgba(0, 0, 0, 0.3)",
+              position: "sticky",
+              top: "90px",
+            }}
+          >
+            <h2
+              style={{
+                fontSize: "1.25rem",
+                fontWeight: 700,
+                color: "var(--text-main)",
+                marginBottom: "1.25rem",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+              }}
+            >
+              <span>Order Summary</span>
+              <span style={{ fontSize: "0.85rem", color: "var(--text-muted)", fontWeight: 500 }}>
+                {totalUnits} {totalUnits === 1 ? "unit" : "units"}
+              </span>
+            </h2>
+
+            {/* Cart Items Review List */}
+            <div
+              style={{
+                maxHeight: "260px",
+                overflowY: "auto",
+                marginBottom: "1.25rem",
+                paddingRight: "0.25rem",
+                display: "flex",
+                flexDirection: "column",
+                gap: "0.85rem",
+              }}
+            >
+              {cart.map((item) => (
+                <div
+                  key={item.product?._id || item._id}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    paddingBottom: "0.85rem",
+                    borderBottom: "1px solid rgba(255, 255, 255, 0.05)",
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", gap: "0.85rem" }}>
+                    <div
+                      style={{
+                        width: "48px",
+                        height: "48px",
+                        borderRadius: "8px",
+                        overflow: "hidden",
+                        background: "rgba(255, 255, 255, 0.05)",
+                        flexShrink: 0,
+                      }}
+                    >
+                      <img
+                        src={item.product?.image || "https://images.unsplash.com/photo-1523275335684-37898b6baf30"}
+                        alt={item.product?.name}
+                        style={{ width: "100%", height: "100%", objectFit: "cover" }}
+                      />
+                    </div>
+                    <div>
+                      <p
+                        style={{
+                          fontSize: "0.9rem",
+                          fontWeight: 600,
+                          color: "var(--text-main)",
+                          lineHeight: 1.3,
+                          margin: 0,
+                        }}
+                      >
+                        {item.product?.name}
+                      </p>
+                      <p style={{ fontSize: "0.8rem", color: "var(--text-muted)", margin: "0.2rem 0 0" }}>
+                        Qty: {item.quantity} × ₹{item.product?.price?.toLocaleString("en-IN")}
+                      </p>
+                    </div>
+                  </div>
+                  <span style={{ fontSize: "0.95rem", fontWeight: 700, color: "var(--text-main)" }}>
+                    ₹{(item.product?.price * item.quantity).toLocaleString("en-IN")}
+                  </span>
+                </div>
+              ))}
+            </div>
+
+            {/* Totals Breakdown */}
+            <div style={{ display: "flex", flexDirection: "column", gap: "0.75rem", marginBottom: "1.5rem" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", color: "var(--text-muted)", fontSize: "0.9rem" }}>
+                <span>Subtotal</span>
+                <span>₹{subtotal.toLocaleString("en-IN")}</span>
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between", color: "var(--text-muted)", fontSize: "0.9rem" }}>
+                <span>Shipping / Delivery</span>
+                <span style={{ color: "#34d399", fontWeight: 600 }}>FREE</span>
+              </div>
+              <div
+                style={{
+                  height: "1px",
+                  background: "var(--border-subtle)",
+                  margin: "0.5rem 0",
+                }}
+              />
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                }}
+              >
+                <span style={{ fontSize: "1.1rem", fontWeight: 700, color: "var(--text-main)" }}>
+                  Total Amount
+                </span>
+                <span
+                  style={{
+                    fontSize: "1.45rem",
+                    fontWeight: 800,
+                    color: "#818cf8",
+                  }}
+                >
+                  ₹{subtotal.toLocaleString("en-IN")}
+                </span>
+              </div>
+            </div>
+
+            {/* Pay with Razorpay Button */}
+            <button
+              id="pay-razorpay-btn"
+              type="submit"
+              form="checkout-form"
+              disabled={submitting || verifying}
+              className="btn-primary"
+              style={{
+                width: "100%",
+                padding: "0.9rem 1.5rem",
+                fontSize: "1rem",
+                fontWeight: 700,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                gap: "0.6rem",
+                cursor: submitting || verifying ? "not-allowed" : "pointer",
+                opacity: submitting || verifying ? 0.75 : 1,
+              }}
+            >
+              {submitting ? (
+                <>
+                  <div className="spinner" style={{ width: "1.2rem", height: "1.2rem", borderWidth: "2px" }} />
+                  <span>Creating Razorpay Order...</span>
+                </>
+              ) : verifying ? (
+                <>
+                  <div className="spinner" style={{ width: "1.2rem", height: "1.2rem", borderWidth: "2px" }} />
+                  <span>Verifying Payment Signature...</span>
+                </>
+              ) : (
+                <>
+                  <CreditCard size={18} />
+                  <span>Pay with Razorpay (₹{subtotal.toLocaleString("en-IN")})</span>
+                </>
+              )}
+            </button>
+
+            {canSimulatePayment && activePaymentOrder && (
+              <button
+                type="button"
+                id="open-test-simulator-btn"
+                className="btn-outline"
+                onClick={() => setShowTestModal(true)}
+                disabled={submitting || verifying}
+                style={{
+                  width: "100%",
+                  marginTop: "0.75rem",
+                  padding: "0.75rem 1.5rem",
+                  fontSize: "0.9rem",
+                  fontWeight: 600,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  gap: "0.5rem",
+                }}
+              >
+                <Zap size={16} />
+                <span>Complete with test simulator</span>
+              </button>
+            )}
+
+            <p style={{ margin: "0.85rem 0 0", fontSize: "0.75rem", color: "var(--text-muted)", lineHeight: 1.5 }}>
+              Razorpay test card: <span style={{ fontFamily: "monospace", color: "#c7d2fe" }}>4111 1111 1111 1111</span>
+              {" "}· any future expiry · CVV 123. If checkout says payment could not be processed, use the test simulator.
+            </p>
+
+            {/* Trust Badges */}
+            <div
+              style={{
+                marginTop: "1.25rem",
+                display: "flex",
+                flexDirection: "column",
+                gap: "0.5rem",
+                textAlign: "center",
+                fontSize: "0.8rem",
+                color: "var(--text-muted)",
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: "0.4rem" }}>
+                <Lock size={13} color="#34d399" />
+                <span>256-Bit SSL Secured Payment via Razorpay</span>
+              </div>
+              <p style={{ margin: 0, fontSize: "0.75rem", opacity: 0.8 }}>
+                Test Mode: No real funds will be deducted.
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Razorpay Test Mode Simulator Dialog */}
+      {showTestModal && activePaymentOrder && (
+        <div
+          style={{
+            position: "fixed",
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            background: "rgba(0, 0, 0, 0.75)",
+            backdropFilter: "blur(6px)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 1000,
+            padding: "1rem",
+          }}
+        >
+          <div
+            style={{
+              background: "var(--card-bg, #111827)",
+              border: "1px solid var(--border-subtle)",
+              borderRadius: "16px",
+              padding: "2rem",
+              maxWidth: "460px",
+              width: "100%",
+              boxShadow: "0 20px 40px rgba(0, 0, 0, 0.6)",
+              textAlign: "center",
+            }}
+          >
+            <div
+              style={{
+                width: "56px",
+                height: "56px",
+                borderRadius: "14px",
+                background: "linear-gradient(135deg, #6366f1 0%, #06b6d4 100%)",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                margin: "0 auto 1.25rem",
+              }}
+            >
+              <CreditCard size={28} color="#ffffff" />
+            </div>
+
+            <h3 style={{ fontSize: "1.35rem", fontWeight: 700, color: "var(--text-main)", marginBottom: "0.4rem" }}>
+              Razorpay Checkout (Test Mode)
+            </h3>
+            <p style={{ color: "var(--text-muted)", fontSize: "0.875rem", marginBottom: "1.25rem" }}>
+              Simulate standard Razorpay Test Mode checkout callback.
+            </p>
+
+            <div
+              style={{
+                background: "rgba(0, 0, 0, 0.3)",
+                padding: "1rem",
+                borderRadius: "10px",
+                textAlign: "left",
+                marginBottom: "1.5rem",
+                fontSize: "0.85rem",
+                display: "flex",
+                flexDirection: "column",
+                gap: "0.4rem",
+              }}
+            >
+              <div style={{ display: "flex", justifyContent: "space-between" }}>
+                <span style={{ color: "var(--text-muted)" }}>Razorpay Order ID:</span>
+                <span style={{ fontFamily: "monospace", color: "#818cf8" }}>{activePaymentOrder.razorpayOrderId}</span>
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between" }}>
+                <span style={{ color: "var(--text-muted)" }}>Total Amount:</span>
+                <span style={{ fontWeight: 700, color: "var(--text-main)" }}>
+                  ₹{(activePaymentOrder.amount / 100).toLocaleString("en-IN")}
+                </span>
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between" }}>
+                <span style={{ color: "var(--text-muted)" }}>Merchant Key:</span>
+                <span style={{ fontFamily: "monospace", color: "var(--text-muted)" }}>{activePaymentOrder.key}</span>
+              </div>
+            </div>
+
+            <div style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}>
+              <button
+                id="simulate-success-btn"
+                onClick={handleSimulateSuccess}
+                disabled={verifying}
+                className="btn-primary"
+                style={{
+                  padding: "0.8rem",
+                  fontSize: "0.95rem",
+                  fontWeight: 600,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  gap: "0.5rem",
+                  background: "#10b981",
+                  borderColor: "#10b981",
+                }}
+              >
+                {verifying ? (
+                  <div className="spinner" style={{ width: "1rem", height: "1rem" }} />
+                ) : (
+                  <CheckCircle2 size={18} />
+                )}
+                <span>Simulate Successful Payment (Test)</span>
+              </button>
+
+              <button
+                id="simulate-fail-btn"
+                onClick={handleSimulateFailure}
+                disabled={verifying}
+                className="btn-outline"
+                style={{
+                  padding: "0.75rem",
+                  fontSize: "0.9rem",
+                  fontWeight: 500,
+                  color: "#f87171",
+                  borderColor: "rgba(239, 68, 68, 0.3)",
+                }}
+              >
+                Simulate Failed / Cancelled Payment
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default Checkout;
