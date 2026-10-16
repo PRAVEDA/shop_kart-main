@@ -1,9 +1,22 @@
 const dns = require("dns");
+const fs = require("fs");
 const path = require("path");
 const dotenv = require("dotenv");
 
 dns.setServers(["8.8.8.8", "1.1.1.1", "8.8.4.4", "208.67.222.222"]);
-dotenv.config({ path: path.resolve(__dirname, "../.env") });
+const backendEnvPath = path.resolve(__dirname, ".env");
+const rootEnvPath = path.resolve(__dirname, "../.env");
+const selectedEnvPath = fs.existsSync(backendEnvPath) ? backendEnvPath : rootEnvPath;
+const dotenvResult = dotenv.config({ path: selectedEnvPath });
+const razorpayKeyId = process.env.RAZORPAY_KEY_ID?.trim();
+console.info("[Razorpay config]", JSON.stringify({
+    envFile: path.relative(__dirname, selectedEnvPath),
+    dotenvLoaded: Boolean(dotenvResult.parsed),
+    mode: process.env.RAZORPAY_MODE || "test",
+    keyIdPresent: Boolean(razorpayKeyId),
+    keyIdPrefix: razorpayKeyId?.slice(0, 9) || null,
+    keySecretPresent: Boolean(process.env.RAZORPAY_KEY_SECRET?.trim()),
+}));
 
 const express = require("express");
 const mongoose = require("mongoose");

@@ -1,15 +1,29 @@
-const crypto = require("crypto");
 const mongoose = require("mongoose");
 const Order = require("../models/order.model");
 const Customer = require("../models/customer.model");
 const Product = require("../models/product.model");
-const razorpay = require("../config/razorpay");
+const { createRazorpayClient, getRazorpayCredentials } = require("../config/razorpay");
+const verifyRazorpaySignature = require("../utils/verifyRazorpaySignature");
 const {
   inMemoryOrders,
   inMemoryCarts,
   inMemoryCustomers,
   fallbackProducts,
 } = require("../utils/inMemoryStore");
+
+const paymentOrderCreations = new Set();
+
+const paymentOrderResponse = (order, credentials, customer, idempotent = false) => ({
+  success: true,
+  message: idempotent ? "Existing payment order returned." : "Order created successfully. Ready for payment.",
+  shopKartOrderId: order._id,
+  razorpayOrderId: order.razorpayOrderId,
+  amount: Math.round(Number(order.totalAmount) * 100),
+  currency: "INR",
+  key: order.razorpayKeyId || credentials.keyId,
+  customerEmail: customer.email || "",
+  idempotent,
+});
 
 /**
  * Task 4: Create Payment Order
@@ -19,13 +33,20 @@ const {
  */
 exports.createPaymentOrder = async (req, res) => {
   try {
-    const { shippingAddress } = req.body;
+    const { shippingAddress, idempotencyKey } = req.body || {};
 
     // Validate shipping address inputs
     if (!shippingAddress) {
       return res.status(400).json({
         success: false,
         message: "Shipping address is required",
+      });
+    }
+
+    if (typeof idempotencyKey !== "string" || !/^[a-f0-9-]{36}$/i.test(idempotencyKey)) {
+      return res.status(400).json({
+        success: false,
+        message: "A valid checkout idempotency key is required",
       });
     }
 
@@ -110,13 +131,20 @@ exports.createPaymentOrder = async (req, res) => {
       }
 
       if (!product) {
-        product = fallbackProducts.find((p) => p._id === prodId) || (typeof item.product === "object" ? item.product : null);
+        product = fallbackProducts.find((p) => p._id === prodId);
       }
 
       if (!product) {
         return res.status(400).json({
           success: false,
           message: "One or more products in your cart are no longer available",
+        });
+      }
+
+      if (!Number.isInteger(item.quantity) || item.quantity < 1) {
+        return res.status(400).json({
+          success: false,
+          message: "Cart quantities must be positive whole numbers",
         });
       }
 
@@ -138,13 +166,56 @@ exports.createPaymentOrder = async (req, res) => {
       });
     }
 
-    const orderId = new mongoose.Types.ObjectId().toString();
+    let credentials;
+    let razorpayClient;
+    try {
+      credentials = getRazorpayCredentials();
+      razorpayClient = createRazorpayClient(credentials);
+    } catch (configurationError) {
+      return res.status(503).json({
+        success: false,
+        message: configurationError.message,
+      });
+    }
 
-    // Create pending ShopKart order
-    let shopKartOrder;
-    if (mongoose.connection.readyState === 1) {
-      try {
-        shopKartOrder = new Order({
+    const customerId = customer._id.toString();
+    const creationKey = `${customerId}:${idempotencyKey}`;
+    if (paymentOrderCreations.has(creationKey)) {
+      return res.status(409).json({
+        success: false,
+        message: "This checkout request is already being processed. Please wait and retry.",
+      });
+    }
+
+    paymentOrderCreations.add(creationKey);
+    try {
+      const databaseAvailable = mongoose.connection.readyState === 1;
+      let shopKartOrder = databaseAvailable
+        ? await Order.findOne({ user: customer._id, checkoutRequestId: idempotencyKey })
+        : Array.from(inMemoryOrders.values()).find(
+          (order) => order.user.toString() === customerId && order.checkoutRequestId === idempotencyKey
+        );
+
+      if (shopKartOrder?.paymentStatus === "PAID") {
+        return res.status(409).json({
+          success: false,
+          message: "This checkout request has already been paid.",
+        });
+      }
+
+      if (shopKartOrder?.paymentStatus === "FAILED") {
+        return res.status(409).json({
+          success: false,
+          message: "This checkout request has already failed. Start checkout again.",
+        });
+      }
+
+      if (shopKartOrder?.razorpayOrderId) {
+        return res.status(200).json(paymentOrderResponse(shopKartOrder, credentials, customer, true));
+      }
+
+      if (!shopKartOrder) {
+        const orderData = {
           user: customer._id,
           items: orderItems,
           shippingAddress: {
@@ -158,91 +229,79 @@ exports.createPaymentOrder = async (req, res) => {
           totalAmount: serverTotal,
           status: "PENDING_PAYMENT",
           paymentStatus: "PENDING",
-        });
-      } catch (e) {
-        shopKartOrder = null;
+          checkoutRequestId: idempotencyKey,
+          razorpayKeyId: credentials.keyId,
+        };
+
+        if (databaseAvailable) {
+          shopKartOrder = new Order(orderData);
+          try {
+            await shopKartOrder.save();
+          } catch (saveError) {
+            if (saveError.code !== 11000) throw saveError;
+            shopKartOrder = await Order.findOne({ user: customer._id, checkoutRequestId: idempotencyKey });
+            if (!shopKartOrder) throw saveError;
+            if (shopKartOrder.razorpayOrderId) {
+              return res.status(200).json(paymentOrderResponse(shopKartOrder, credentials, customer, true));
+            }
+          }
+        } else {
+          shopKartOrder = {
+            ...orderData,
+            _id: new mongoose.Types.ObjectId().toString(),
+            createdAt: new Date().toISOString(),
+          };
+          inMemoryOrders.set(shopKartOrder._id, shopKartOrder);
+        }
       }
-    }
 
-    if (!shopKartOrder) {
-      shopKartOrder = {
-        _id: orderId,
-        user: customer._id,
-        items: orderItems,
-        shippingAddress: {
-          fullName: fullName.trim(),
-          phone: phone.trim(),
-          addressLine1: addressLine1.trim(),
-          city: city.trim(),
-          state: state.trim(),
-          pincode: pincode.trim(),
-        },
-        totalAmount: serverTotal,
-        status: "PENDING_PAYMENT",
-        paymentStatus: "PENDING",
-        createdAt: new Date().toISOString(),
-      };
-      inMemoryOrders.set(orderId, shopKartOrder);
-    }
-
-    // Create Razorpay Order in paise (1 INR = 100 paise)
-    const amountInPaise = Math.round(serverTotal * 100);
-    let razorpayOrderId = null;
-    const keyId = process.env.RAZORPAY_KEY_ID || "";
-    const isPlaceholderKey = !keyId || keyId === "rzp_test_shopkart1234" || keyId.toLowerCase().includes("mock");
-    let useSimulator = process.env.NODE_ENV !== "production" && isPlaceholderKey;
-    let simulatorFallbackMessage = false;
-
-    if (useSimulator) {
-      razorpayOrderId = "order_" + crypto.randomBytes(8).toString("hex");
-    } else {
+      const amountInPaise = Math.round(serverTotal * 100);
+      let razorpayOrder;
       try {
-        const rzpOrder = await razorpay.orders.create({
+        razorpayOrder = await razorpayClient.orders.create({
           amount: amountInPaise,
           currency: "INR",
           receipt: shopKartOrder._id.toString().slice(0, 40),
-          payment_capture: 1,
-          notes: {
-            shopKartOrderId: shopKartOrder._id.toString(),
-          },
+          notes: { shopKartOrderId: shopKartOrder._id.toString() },
         });
-        razorpayOrderId = rzpOrder.id;
-      } catch (rzpErr) {
-        if (process.env.NODE_ENV !== "production" && keyId.startsWith("rzp_test_")) {
-          useSimulator = true;
-          simulatorFallbackMessage = true;
-          razorpayOrderId = "order_" + crypto.randomBytes(8).toString("hex");
-        } else {
-          console.error("Razorpay order creation failed:", rzpErr.statusCode || "unknown status");
-          return res.status(502).json({
-            success: false,
-            message: "Razorpay could not create a payment order. Check the merchant credentials and try again.",
-          });
-        }
+      } catch (razorpayError) {
+        const authenticationFailed = razorpayError.statusCode === 401;
+        const providerError = razorpayError.error || {};
+        const safeDescription = String(providerError.description || razorpayError.description || "Razorpay order request failed")
+          .replace(/[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/g, "[redacted email]")
+          .replace(/\b\d{7,}\b/g, "[redacted number]")
+          .replace(/rzp_(?:test|live)_[A-Za-z0-9]+/gi, "[redacted key]")
+          .replace(/(?:key[_\s-]?secret\s*[:=]\s*)\S+/gi, "$1[redacted]")
+          .replace(/\b[A-Za-z0-9_-]{32,}\b/g, "[redacted value]")
+          .slice(0, 240);
+        const safeErrorCode = String(providerError.code || razorpayError.code || "unknown")
+          .replace(/[^A-Za-z0-9_.-]/g, "")
+          .slice(0, 64);
+        console.error("Razorpay order creation failed:", JSON.stringify({
+          httpStatus: Number(razorpayError.statusCode || razorpayError.status) || null,
+          errorCode: safeErrorCode,
+          description: safeDescription,
+        }));
+        return res.status(502).json({
+          success: false,
+          message: authenticationFailed
+            ? "Razorpay rejected the Test Mode credentials. Confirm the Key ID and Key Secret are the matching pair from the same Test Mode API key."
+            : "Razorpay could not create a payment order. Verify the test API credentials and try again.",
+        });
       }
-    }
 
-    shopKartOrder.razorpayOrderId = razorpayOrderId;
-    if (typeof shopKartOrder.save === "function") {
-      await shopKartOrder.save();
-    } else {
-      inMemoryOrders.set(shopKartOrder._id.toString(), shopKartOrder);
-    }
+      shopKartOrder.razorpayOrderId = razorpayOrder.id;
+      shopKartOrder.razorpayKeyId = credentials.keyId;
+      if (typeof shopKartOrder.save === "function") {
+        await shopKartOrder.save();
+      } else {
+        inMemoryOrders.set(shopKartOrder._id.toString(), shopKartOrder);
+      }
 
-    return res.status(201).json({
-      success: true,
-      message: simulatorFallbackMessage
-        ? "Razorpay is unavailable; continue with the test simulator."
-        : "Order created successfully. Ready for payment.",
-      shopKartOrderId: shopKartOrder._id,
-      razorpayOrderId,
-      amount: amountInPaise,
-      currency: "INR",
-      key: useSimulator ? "rzp_test_shopkart1234" : keyId,
-      paymentMode: useSimulator ? "simulated" : "razorpay",
-      allowTestSimulation: process.env.NODE_ENV !== "production" && keyId.startsWith("rzp_test_"),
-      customerEmail: customer.email || "",
-    });
+      return res.status(201).json(paymentOrderResponse(shopKartOrder, credentials, customer));
+    } finally {
+      paymentOrderCreations.delete(creationKey);
+    }
   } catch (error) {
     console.error("Create payment order error:", error);
     return res.status(500).json({
@@ -260,7 +319,7 @@ exports.createPaymentOrder = async (req, res) => {
  */
 exports.verifyPayment = async (req, res) => {
   try {
-    const { shopKartOrderId, razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+    const { shopKartOrderId, razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body || {};
 
     if (!shopKartOrderId || !razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
       return res.status(400).json({
@@ -309,61 +368,116 @@ exports.verifyPayment = async (req, res) => {
       });
     }
 
-    // Verify HMAC-SHA256 signature
-    // The trusted order id is the razorpayOrderId stored on our server
-    const secret = process.env.RAZORPAY_KEY_SECRET || "shopkart_test_secret_1234";
-    const body = order.razorpayOrderId + "|" + razorpay_payment_id;
-
-    const expectedSignature = crypto
-      .createHmac("sha256", secret)
-      .update(body)
-      .digest("hex");
-
-    if (expectedSignature !== razorpay_signature) {
-      order.paymentStatus = "FAILED";
-      if (typeof order.save === "function") {
-        await order.save();
-      } else {
-        inMemoryOrders.set(order._id.toString(), order);
+    if (order.paymentStatus === "PAID") {
+      if (order.razorpayPaymentId === razorpay_payment_id) {
+        return res.status(200).json({ success: true, message: "Payment was already verified.", order });
       }
-      // DO NOT clear cart on failed signature!
+      return res.status(409).json({ success: false, message: "This order has already been paid." });
+    }
+
+    if (order.paymentStatus !== "PENDING" || order.status !== "PENDING_PAYMENT") {
+      return res.status(409).json({ success: false, message: "This order is not awaiting payment." });
+    }
+
+    let credentials;
+    let razorpayClient;
+    try {
+      credentials = getRazorpayCredentials();
+      razorpayClient = createRazorpayClient(credentials);
+    } catch (configurationError) {
+      return res.status(503).json({ success: false, message: configurationError.message });
+    }
+
+    if (order.razorpayKeyId !== credentials.keyId) {
+      return res.status(409).json({
+        success: false,
+        message: "The payment order was created with different Razorpay credentials.",
+      });
+    }
+
+    if (!verifyRazorpaySignature({
+      orderId: order.razorpayOrderId,
+      paymentId: razorpay_payment_id,
+      signature: razorpay_signature,
+      secret: credentials.keySecret,
+    })) {
       return res.status(400).json({
         success: false,
         message: "Invalid payment signature. Verification failed.",
       });
     }
 
-    // Signature verified! Confirm order
-    order.paymentStatus = "PAID";
-    order.status = "PLACED";
-    order.razorpayPaymentId = razorpay_payment_id;
-    order.razorpaySignature = razorpay_signature;
+    let payment;
+    try {
+      payment = await razorpayClient.payments.fetch(razorpay_payment_id);
+    } catch (razorpayError) {
+      console.error("Razorpay payment lookup failed:", razorpayError.statusCode || "unknown status");
+      return res.status(502).json({
+        success: false,
+        message: "Razorpay could not confirm the payment. Your cart has not been cleared.",
+      });
+    }
 
-    if (typeof order.save === "function") {
-      await order.save();
+    const expectedAmount = Math.round(Number(order.totalAmount) * 100);
+    if (
+      payment.order_id !== order.razorpayOrderId ||
+      payment.amount !== expectedAmount ||
+      payment.currency !== "INR" ||
+      payment.status !== "captured"
+    ) {
+      return res.status(409).json({
+        success: false,
+        message: "Razorpay has not confirmed a captured payment for this order. Your cart has not been cleared.",
+      });
+    }
 
-      // Decrement stock for ordered items
+    const paidFields = {
+      paymentStatus: "PAID",
+      status: "PLACED",
+      razorpayPaymentId: razorpay_payment_id,
+      razorpaySignature: razorpay_signature,
+    };
+
+    if (mongoose.connection.readyState === 1) {
+      const paidOrder = await Order.findOneAndUpdate(
+        {
+          _id: order._id,
+          user: req.user._id,
+          paymentStatus: "PENDING",
+          status: "PENDING_PAYMENT",
+          razorpayOrderId: order.razorpayOrderId,
+        },
+        { $set: paidFields },
+        { new: true }
+      );
+
+      if (!paidOrder) {
+        const latestOrder = await Order.findById(order._id);
+        if (latestOrder?.paymentStatus === "PAID" && latestOrder.razorpayPaymentId === razorpay_payment_id) {
+          return res.status(200).json({ success: true, message: "Payment was already verified.", order: latestOrder });
+        }
+        return res.status(409).json({ success: false, message: "This order has already been processed." });
+      }
+
+      order = paidOrder;
       for (const item of order.items) {
-        await Product.findByIdAndUpdate(item.product, {
-          $inc: { stock: -item.quantity },
-        });
+        await Product.findByIdAndUpdate(item.product, { $inc: { stock: -item.quantity } });
+      }
+      await Customer.findByIdAndUpdate(req.user._id, { $set: { cart: [] } });
+    } else {
+      if (order.paymentStatus !== "PENDING") {
+        if (order.paymentStatus === "PAID" && order.razorpayPaymentId === razorpay_payment_id) {
+          return res.status(200).json({ success: true, message: "Payment was already verified.", order });
+        }
+        return res.status(409).json({ success: false, message: "This order has already been processed." });
       }
 
-      // Clear user's cart in database
-      const customer = await Customer.findById(req.user._id);
-      if (customer) {
-        customer.cart = [];
-        await customer.save();
-      }
-    } else {
-      // In-memory update
+      Object.assign(order, paidFields);
       inMemoryOrders.set(order._id.toString(), order);
       inMemoryCarts.set(req.user._id.toString(), []);
       for (const item of order.items) {
-        const prod = fallbackProducts.find((p) => p._id === item.product.toString());
-        if (prod) {
-          prod.stock = Math.max(0, prod.stock - item.quantity);
-        }
+        const product = fallbackProducts.find((p) => p._id === item.product.toString());
+        if (product) product.stock = Math.max(0, product.stock - item.quantity);
       }
     }
 
@@ -548,43 +662,3 @@ exports.updateOrderStatus = async (req, res) => {
   }
 };
 
-/**
- * Development / Test Helper: Generate Test Signature
- * POST /orders/test-signature
- * Allows testing HMAC verification without exposing secret to client.
- */
-exports.generateTestSignature = async (req, res) => {
-  try {
-    if (process.env.NODE_ENV === "production") {
-      return res.status(404).json({
-        success: false,
-        message: "Not found",
-      });
-    }
-
-    const { razorpayOrderId, razorpayPaymentId } = req.body;
-    if (!razorpayOrderId || !razorpayPaymentId) {
-      return res.status(400).json({
-        success: false,
-        message: "razorpayOrderId and razorpayPaymentId are required",
-      });
-    }
-
-    const secret = process.env.RAZORPAY_KEY_SECRET || "shopkart_test_secret_1234";
-    const signature = crypto
-      .createHmac("sha256", secret)
-      .update(`${razorpayOrderId}|${razorpayPaymentId}`)
-      .digest("hex");
-
-    return res.status(200).json({
-      success: true,
-      signature,
-    });
-  } catch (error) {
-    return res.status(500).json({
-      success: false,
-      message: "Error generating test signature",
-      error: error.message,
-    });
-  }
-};

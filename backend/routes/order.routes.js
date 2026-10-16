@@ -9,6 +9,5 @@ router.post("/verify-payment", authMiddleware, orderController.verifyPayment);
 router.get("/", authMiddleware, orderController.getMyOrders);
 router.get("/:id", authMiddleware, orderController.getOrderById);
 router.patch("/:id/status", authMiddleware, orderController.updateOrderStatus);
-router.post("/test-signature", orderController.generateTestSignature);
 
 module.exports = router;

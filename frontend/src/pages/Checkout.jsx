@@ -1,23 +1,35 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { useNavigate, Link } from "react-router-dom";
-import { ShieldCheck, ArrowLeft, ShoppingBag, CreditCard, AlertCircle, CheckCircle2, Lock, Zap } from "lucide-react";
+import { ArrowLeft, ShoppingBag, CreditCard, AlertCircle, Lock, Zap } from "lucide-react";
 import CheckoutForm from "../components/CheckoutForm";
 import { useCart } from "../context/CartContext";
-import { createPaymentOrder, verifyPayment, getTestSignature } from "../services/api";
+import { createPaymentOrder, verifyPayment } from "../services/api";
+import { getProductImageSource, handleProductImageError } from "../services/productImages";
+
+let razorpayScriptPromise = null;
 
 const loadRazorpayScript = () => {
-  return new Promise((resolve) => {
-    if (window.Razorpay) {
-      resolve(true);
-      return;
-    }
+  if (window.Razorpay) return Promise.resolve(true);
+  if (razorpayScriptPromise) return razorpayScriptPromise;
+
+  razorpayScriptPromise = new Promise((resolve) => {
     const script = document.createElement("script");
     script.src = "https://checkout.razorpay.com/v1/checkout.js";
     script.async = true;
-    script.onload = () => resolve(true);
-    script.onerror = () => resolve(false);
+    script.onload = () => {
+      const loaded = Boolean(window.Razorpay);
+      if (!loaded) razorpayScriptPromise = null;
+      resolve(loaded);
+    };
+    script.onerror = () => {
+      script.remove();
+      razorpayScriptPromise = null;
+      resolve(false);
+    };
     document.body.appendChild(script);
   });
+
+  return razorpayScriptPromise;
 };
 
 const Checkout = ({ user }) => {
@@ -37,9 +49,9 @@ const Checkout = ({ user }) => {
   const [submitting, setSubmitting] = useState(false);
   const [verifying, setVerifying] = useState(false);
   const [serverError, setServerError] = useState("");
-  const [activePaymentOrder, setActivePaymentOrder] = useState(null);
-  const [showTestModal, setShowTestModal] = useState(false);
-  const [canSimulatePayment, setCanSimulatePayment] = useState(false);
+  const checkoutInProgressRef = useRef(false);
+  const verificationStartedRef = useRef(false);
+  const [checkoutRequestId] = useState(() => window.crypto.randomUUID());
 
   // Pre-load Razorpay script on mount
   useEffect(() => {
@@ -81,36 +93,39 @@ const Checkout = ({ user }) => {
 
   // Complete Payment Verification Flow (Step 11 & 13)
   const handlePaymentSuccess = async (paymentDetails) => {
+    if (verificationStartedRef.current) return;
+    verificationStartedRef.current = true;
     setVerifying(true);
     setServerError("");
-    setCanSimulatePayment(false);
     try {
       const verifyRes = await verifyPayment(paymentDetails);
-      if (verifyRes.success) {
-        // Clear global cart state and Navbar count immediately
-        clearCart();
-        // Navigate to Order Confirmation / Details page
-        navigate(`/orders/${paymentDetails.shopKartOrderId}`, {
-          state: {
-            orderSuccess: true,
-            order: verifyRes.order,
-          },
-        });
+      if (!verifyRes.success) {
+        throw new Error(verifyRes.message || "Payment verification failed");
       }
+
+      clearCart();
+      navigate(`/orders/${paymentDetails.shopKartOrderId}`, {
+        state: {
+          orderSuccess: true,
+          order: verifyRes.order,
+        },
+      });
     } catch (err) {
       console.error("Payment verification error:", err);
       const msg = err.response?.data?.message || "Payment verification failed. Your cart was not cleared.";
       setServerError(msg);
     } finally {
+      verificationStartedRef.current = false;
+      checkoutInProgressRef.current = false;
       setVerifying(false);
       setSubmitting(false);
-      setShowTestModal(false);
     }
   };
 
   // Step 7, 8, 9, 10: Checkout & Razorpay Submission
   const handleCheckoutSubmit = async (e) => {
     e.preventDefault();
+    if (checkoutInProgressRef.current) return;
     setServerError("");
 
     if (!validateForm()) {
@@ -122,36 +137,21 @@ const Checkout = ({ user }) => {
       return;
     }
 
+    checkoutInProgressRef.current = true;
     setSubmitting(true);
     try {
-      // 1. Create order on backend (revalidates prices & stock, calculates server total)
-      const orderData = await createPaymentOrder(formData);
+      const orderData = await createPaymentOrder(formData, checkoutRequestId);
 
       if (!orderData.success) {
         throw new Error(orderData.message || "Failed to create payment order");
       }
 
-      setActivePaymentOrder(orderData);
-      setCanSimulatePayment(orderData.allowTestSimulation === true);
-
-      if (orderData.paymentMode === "simulated") {
-        // Open Test Mode Simulator Dialog directly
-        setShowTestModal(true);
-        setSubmitting(false);
-        return;
-      }
-
-      // Load Razorpay script for live/registered test keys
       const scriptLoaded = await loadRazorpayScript();
 
       if (!scriptLoaded || !window.Razorpay) {
-        if (orderData.allowTestSimulation) {
-          setServerError("Razorpay Checkout could not be loaded. You can finish this order with the test simulator.");
-          setShowTestModal(true);
-        } else {
-          setServerError("Razorpay Checkout could not be loaded. Check your connection and try again.");
-        }
+        setServerError("Razorpay Checkout could not be loaded. Check your connection and try again. Your cart is unchanged.");
         setSubmitting(false);
+        checkoutInProgressRef.current = false;
         return;
       }
 
@@ -163,7 +163,7 @@ const Checkout = ({ user }) => {
         name: "ShopKart",
         description: "Secure Order Checkout",
         order_id: orderData.razorpayOrderId,
-        handler: async function (response) {
+        handler: async (response) => {
           await handlePaymentSuccess({
             shopKartOrderId: orderData.shopKartOrderId,
             razorpay_order_id: response.razorpay_order_id,
@@ -173,22 +173,23 @@ const Checkout = ({ user }) => {
         },
         prefill: {
           name: formData.fullName,
-          email: orderData.customerEmail || user?.email || "customer@shopkart.test",
+          email: orderData.customerEmail || user?.email || "",
           contact: `+91${formData.phone.trim()}`,
         },
         notes: {
           shopKartOrderId: String(orderData.shopKartOrderId),
         },
-        retry: {
-          enabled: true,
-          max_count: 3,
-        },
+        retry: { enabled: true },
         theme: {
           color: "#6366f1",
         },
         modal: {
           ondismiss: function () {
-            setSubmitting(false);
+            if (!verificationStartedRef.current) {
+              setServerError("Checkout was cancelled. Your cart has not been cleared.");
+              setSubmitting(false);
+              checkoutInProgressRef.current = false;
+            }
           },
         },
       };
@@ -200,56 +201,22 @@ const Checkout = ({ user }) => {
           const description = response.error?.description || "Your payment could not be processed";
           setServerError(`Payment Failed: ${description}. Your cart has not been cleared.`);
           setSubmitting(false);
-          if (orderData.allowTestSimulation) {
-            setShowTestModal(true);
-          }
+          checkoutInProgressRef.current = false;
         });
         rzp.open();
       } catch (err) {
         console.error("Razorpay checkout could not be opened:", err);
-        if (orderData.allowTestSimulation) {
-          setServerError("Razorpay Checkout could not be opened. You can finish this order with the test simulator.");
-          setShowTestModal(true);
-        } else {
-          setServerError("Razorpay Checkout could not be opened. Please try again.");
-        }
+        setServerError("Razorpay Checkout could not be opened. Please try again. Your cart is unchanged.");
         setSubmitting(false);
+        checkoutInProgressRef.current = false;
       }
     } catch (err) {
       console.error("Checkout initiation error:", err);
       const msg = err.response?.data?.message || err.message || "Error processing checkout";
       setServerError(msg);
       setSubmitting(false);
+      checkoutInProgressRef.current = false;
     }
-  };
-
-  // Test Mode Simulator: Simulate successful payment
-  const handleSimulateSuccess = async () => {
-    if (!activePaymentOrder) return;
-    setVerifying(true);
-    try {
-      const mockPaymentId = `pay_test_${Date.now()}`;
-      // Request signed HMAC from server helper
-      const sigData = await getTestSignature(activePaymentOrder.razorpayOrderId, mockPaymentId);
-
-      await handlePaymentSuccess({
-        shopKartOrderId: activePaymentOrder.shopKartOrderId,
-        razorpay_order_id: activePaymentOrder.razorpayOrderId,
-        razorpay_payment_id: mockPaymentId,
-        razorpay_signature: sigData.signature,
-      });
-    } catch (err) {
-      setServerError(err.response?.data?.message || "Simulated payment verification failed");
-      setVerifying(false);
-      setShowTestModal(false);
-    }
-  };
-
-  // Test Mode Simulator: Simulate failed payment
-  const handleSimulateFailure = () => {
-    setServerError("Simulated Payment Declined by user or issuing bank. Your cart has not been cleared.");
-    setShowTestModal(false);
-    setSubmitting(false);
   };
 
   // If cart is empty and no active verification
@@ -377,20 +344,6 @@ const Checkout = ({ user }) => {
           >
             <AlertCircle size={20} style={{ flexShrink: 0 }} />
             <span>{serverError}</span>
-            {canSimulatePayment && activePaymentOrder && (
-              <button
-                type="button"
-                className="btn-outline"
-                onClick={() => {
-                  setServerError("");
-                  setShowTestModal(true);
-                }}
-                style={{ flexShrink: 0 }}
-              >
-                <Zap size={15} />
-                <span>Use test simulator</span>
-              </button>
-            )}
           </div>
         )}
 
@@ -479,9 +432,10 @@ const Checkout = ({ user }) => {
                       }}
                     >
                       <img
-                        src={item.product?.image || "https://images.unsplash.com/photo-1523275335684-37898b6baf30"}
+                        src={getProductImageSource(item.product?.image)}
                         alt={item.product?.name}
                         style={{ width: "100%", height: "100%", objectFit: "cover" }}
+                        onError={handleProductImageError}
                       />
                     </div>
                     <div>
@@ -585,33 +539,8 @@ const Checkout = ({ user }) => {
               )}
             </button>
 
-            {canSimulatePayment && activePaymentOrder && (
-              <button
-                type="button"
-                id="open-test-simulator-btn"
-                className="btn-outline"
-                onClick={() => setShowTestModal(true)}
-                disabled={submitting || verifying}
-                style={{
-                  width: "100%",
-                  marginTop: "0.75rem",
-                  padding: "0.75rem 1.5rem",
-                  fontSize: "0.9rem",
-                  fontWeight: 600,
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  gap: "0.5rem",
-                }}
-              >
-                <Zap size={16} />
-                <span>Complete with test simulator</span>
-              </button>
-            )}
-
             <p style={{ margin: "0.85rem 0 0", fontSize: "0.75rem", color: "var(--text-muted)", lineHeight: 1.5 }}>
-              Razorpay test card: <span style={{ fontFamily: "monospace", color: "#c7d2fe" }}>4111 1111 1111 1111</span>
-              {" "}· any future expiry · CVV 123. If checkout says payment could not be processed, use the test simulator.
+              Complete your payment in Razorpay Test Mode. No real funds will be deducted.
             </p>
 
             {/* Trust Badges */}
@@ -638,132 +567,6 @@ const Checkout = ({ user }) => {
         </div>
       </div>
 
-      {/* Razorpay Test Mode Simulator Dialog */}
-      {showTestModal && activePaymentOrder && (
-        <div
-          style={{
-            position: "fixed",
-            top: 0,
-            left: 0,
-            right: 0,
-            bottom: 0,
-            background: "rgba(0, 0, 0, 0.75)",
-            backdropFilter: "blur(6px)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            zIndex: 1000,
-            padding: "1rem",
-          }}
-        >
-          <div
-            style={{
-              background: "var(--card-bg, #111827)",
-              border: "1px solid var(--border-subtle)",
-              borderRadius: "16px",
-              padding: "2rem",
-              maxWidth: "460px",
-              width: "100%",
-              boxShadow: "0 20px 40px rgba(0, 0, 0, 0.6)",
-              textAlign: "center",
-            }}
-          >
-            <div
-              style={{
-                width: "56px",
-                height: "56px",
-                borderRadius: "14px",
-                background: "linear-gradient(135deg, #6366f1 0%, #06b6d4 100%)",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                margin: "0 auto 1.25rem",
-              }}
-            >
-              <CreditCard size={28} color="#ffffff" />
-            </div>
-
-            <h3 style={{ fontSize: "1.35rem", fontWeight: 700, color: "var(--text-main)", marginBottom: "0.4rem" }}>
-              Razorpay Checkout (Test Mode)
-            </h3>
-            <p style={{ color: "var(--text-muted)", fontSize: "0.875rem", marginBottom: "1.25rem" }}>
-              Simulate standard Razorpay Test Mode checkout callback.
-            </p>
-
-            <div
-              style={{
-                background: "rgba(0, 0, 0, 0.3)",
-                padding: "1rem",
-                borderRadius: "10px",
-                textAlign: "left",
-                marginBottom: "1.5rem",
-                fontSize: "0.85rem",
-                display: "flex",
-                flexDirection: "column",
-                gap: "0.4rem",
-              }}
-            >
-              <div style={{ display: "flex", justifyContent: "space-between" }}>
-                <span style={{ color: "var(--text-muted)" }}>Razorpay Order ID:</span>
-                <span style={{ fontFamily: "monospace", color: "#818cf8" }}>{activePaymentOrder.razorpayOrderId}</span>
-              </div>
-              <div style={{ display: "flex", justifyContent: "space-between" }}>
-                <span style={{ color: "var(--text-muted)" }}>Total Amount:</span>
-                <span style={{ fontWeight: 700, color: "var(--text-main)" }}>
-                  ₹{(activePaymentOrder.amount / 100).toLocaleString("en-IN")}
-                </span>
-              </div>
-              <div style={{ display: "flex", justifyContent: "space-between" }}>
-                <span style={{ color: "var(--text-muted)" }}>Merchant Key:</span>
-                <span style={{ fontFamily: "monospace", color: "var(--text-muted)" }}>{activePaymentOrder.key}</span>
-              </div>
-            </div>
-
-            <div style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}>
-              <button
-                id="simulate-success-btn"
-                onClick={handleSimulateSuccess}
-                disabled={verifying}
-                className="btn-primary"
-                style={{
-                  padding: "0.8rem",
-                  fontSize: "0.95rem",
-                  fontWeight: 600,
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  gap: "0.5rem",
-                  background: "#10b981",
-                  borderColor: "#10b981",
-                }}
-              >
-                {verifying ? (
-                  <div className="spinner" style={{ width: "1rem", height: "1rem" }} />
-                ) : (
-                  <CheckCircle2 size={18} />
-                )}
-                <span>Simulate Successful Payment (Test)</span>
-              </button>
-
-              <button
-                id="simulate-fail-btn"
-                onClick={handleSimulateFailure}
-                disabled={verifying}
-                className="btn-outline"
-                style={{
-                  padding: "0.75rem",
-                  fontSize: "0.9rem",
-                  fontWeight: 500,
-                  color: "#f87171",
-                  borderColor: "rgba(239, 68, 68, 0.3)",
-                }}
-              >
-                Simulate Failed / Cancelled Payment
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 };

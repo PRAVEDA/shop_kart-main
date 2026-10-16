@@ -1,5 +1,6 @@
 const jwt = require("jsonwebtoken");
 const Customer = require("../models/customer.model");
+const jwtSecret = require("../utils/jwtSecret");
 
 const authMiddleware = async (req, res, next) => {
     try {
@@ -17,7 +18,7 @@ const authMiddleware = async (req, res, next) => {
             });
         }
 
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        const decoded = jwt.verify(token, jwtSecret);
 
         let customer = null;
         if (require("mongoose").connection.readyState === 1) {

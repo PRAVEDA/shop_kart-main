@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import { Link } from "react-router-dom";
 import { Trash2, Plus, Minus, AlertCircle } from "lucide-react";
+import { getProductImageSource, handleProductImageError } from "../services/productImages";
 import { useCart } from "../context/CartContext";
 
 const CartItem = ({ item }) => {
@@ -79,13 +80,10 @@ const CartItem = ({ item }) => {
           }}
         >
           <img
-            src={product.image}
+            src={getProductImageSource(product.image)}
             alt={product.name}
             style={{ width: "100%", height: "100%", objectFit: "cover" }}
-            onError={(e) => {
-              e.currentTarget.src =
-                "https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?auto=format&fit=crop&w=800&q=80";
-            }}
+            onError={handleProductImageError}
           />
         </Link>
 

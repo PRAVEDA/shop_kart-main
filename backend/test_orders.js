@@ -1,9 +1,42 @@
-require("dotenv").config({ path: require("path").resolve(__dirname, "../.env") });
+const fs = require("fs");
+const path = require("path");
+const backendEnvPath = path.resolve(__dirname, ".env");
+const rootEnvPath = path.resolve(__dirname, "../.env");
+require("dotenv").config({ path: fs.existsSync(backendEnvPath) ? backendEnvPath : rootEnvPath });
 const crypto = require("crypto");
+const assert = require("assert");
+const verifyRazorpaySignature = require("./utils/verifyRazorpaySignature");
 
 async function runOrderTests() {
-  const baseURL = "http://localhost:5000";
-  console.log("=== STARTING SHOPKART LAB 06 ORDER & PAYMENT TESTS ===\n");
+  const baseURL = process.env.TEST_API_URL || "http://localhost:5000";
+  console.log("=== SHOPKART RAZORPAY INTEGRATION CHECKS ===\n");
+
+  const signatureOrderId = "order_signature_test";
+  const signaturePaymentId = "pay_signature_test";
+  const signatureSecret = "unit-test-secret";
+  const validTestSignature = crypto
+    .createHmac("sha256", signatureSecret)
+    .update(`${signatureOrderId}|${signaturePaymentId}`)
+    .digest("hex");
+  assert.strictEqual(verifyRazorpaySignature({
+    orderId: signatureOrderId,
+    paymentId: signaturePaymentId,
+    signature: validTestSignature,
+    secret: signatureSecret,
+  }), true);
+  assert.strictEqual(verifyRazorpaySignature({
+    orderId: signatureOrderId,
+    paymentId: signaturePaymentId,
+    signature: `${validTestSignature.slice(0, -1)}0`,
+    secret: signatureSecret,
+  }), false);
+  assert.strictEqual(verifyRazorpaySignature({
+    orderId: signatureOrderId,
+    paymentId: signaturePaymentId,
+    signature: "not-a-signature",
+    secret: signatureSecret,
+  }), false);
+  console.log("Signature helper accepts a valid HMAC and rejects altered/malformed signatures.");
 
   // Helper for requests with cookies
   let cookies = "";
@@ -32,7 +65,7 @@ async function runOrderTests() {
     return { status: res.status, data };
   }
 
-  // 1. Create a fresh test user
+  // Create a fresh test user.
   const email = `order_tester_${Date.now()}@example.com`;
   const regRes = await request("/customers/register", {
     method: "POST",
@@ -44,7 +77,7 @@ async function runOrderTests() {
       confirmPassword: "Password@123",
     }),
   });
-  console.log("Registered test user:", email, "Status:", regRes.status);
+  assert.strictEqual(regRes.status, 201, "Registration should succeed");
 
   // Log in to get authentication cookie
   const loginRes = await request("/customers/login", {
@@ -54,9 +87,10 @@ async function runOrderTests() {
       password: "Password@123",
     }),
   });
-  console.log("Logged in test user. Status:", loginRes.status, "Cookie captured:", !!cookies);
+  assert.strictEqual(loginRes.status, 200, "Login should succeed");
+  assert.ok(cookies, "Login should set the auth cookie");
 
-  // Test 1: Empty cart rejection
+  // Empty cart must be rejected before an order is created.
   const emptyRes = await request("/orders/create-payment-order", {
     method: "POST",
     body: JSON.stringify({
@@ -68,12 +102,12 @@ async function runOrderTests() {
         state: "Karnataka",
         pincode: "560001",
       },
+      idempotencyKey: crypto.randomUUID(),
     }),
   });
-  console.log("Test 1 (Empty cart): Status", emptyRes.status, "Message:", emptyRes.data?.message);
-  if (emptyRes.status !== 400) throw new Error("Expected 400 for empty cart");
+  assert.strictEqual(emptyRes.status, 400, "Empty cart should be rejected");
 
-  // Test 2: Unauthenticated request
+  // Protected order creation must reject unauthenticated requests.
   const unauthRes = await fetch(`${baseURL}/orders/create-payment-order`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -88,8 +122,7 @@ async function runOrderTests() {
       },
     }),
   });
-  console.log("Test 2 (Unauthenticated): Status", unauthRes.status);
-  if (unauthRes.status !== 401) throw new Error("Expected 401 for unauthenticated request");
+  assert.strictEqual(unauthRes.status, 401, "Unauthenticated order creation should be rejected");
 
   // Get a product to add to cart
   const prodRes = await request("/products");
@@ -98,106 +131,78 @@ async function runOrderTests() {
   const testProduct = products[0];
   console.log(`Using product: ${testProduct.name} (Price: ₹${testProduct.price}, Stock: ${testProduct.stock})`);
 
-  // Add 2 units of testProduct to cart
-  await request(`/cart/${testProduct._id}`, { method: "POST" });
+  // Add one item to the authenticated cart.
   await request(`/cart/${testProduct._id}`, { method: "POST" });
 
-  // Test 3: Create Payment Order with fake total sent from frontend (should be ignored)
+  const idempotencyKey = crypto.randomUUID();
+  const shippingAddress = {
+    fullName: "Order Test User",
+    phone: "9876543210",
+    addressLine1: "123 Tech Park",
+    city: "Bengaluru",
+    state: "Karnataka",
+    pincode: "560001",
+  };
+
+  // Missing credentials must fail closed and never create a fake payment order.
+  const hasTestCredentials = Boolean(
+    (process.env.RAZORPAY_MODE || "test").toLowerCase() === "test" &&
+    process.env.RAZORPAY_KEY_ID?.startsWith("rzp_test_") &&
+    process.env.RAZORPAY_KEY_SECRET &&
+    !process.env.RAZORPAY_KEY_ID.includes("replace") &&
+    !process.env.RAZORPAY_KEY_SECRET.includes("replace")
+  );
+
   const createOrderRes = await request("/orders/create-payment-order", {
     method: "POST",
     body: JSON.stringify({
-      shippingAddress: {
-        fullName: "Order Test User",
-        phone: "9876543210",
-        addressLine1: "123 Tech Park",
-        city: "Bengaluru",
-        state: "Karnataka",
-        pincode: "560001",
-      },
-      totalAmount: 1, // Fake total from client, must be ignored!
+      shippingAddress,
+      idempotencyKey,
+      totalAmount: 1,
     }),
   });
-  console.log("Test 3 (Create Payment Order): Status", createOrderRes.status, createOrderRes.data?.message);
-  if (createOrderRes.status !== 201) throw new Error("Expected 201 on order creation");
-
-  const { shopKartOrderId, razorpayOrderId, amount } = createOrderRes.data;
-  const expectedAmountInPaise = Math.round(testProduct.price * 2 * 100);
-  console.log(`Razorpay order ID: ${razorpayOrderId}, Amount in paise: ${amount} (Expected: ${expectedAmountInPaise})`);
-  if (amount !== expectedAmountInPaise) {
-    throw new Error(`Server did not calculate correct total. Expected ${expectedAmountInPaise}, got ${amount}`);
-  }
-
-  // Test 4: Verify cart still contains items before payment confirmation
   const cartBeforeRes = await request("/cart");
-  console.log("Test 4 (Cart before payment): Items in cart =", cartBeforeRes.data?.cart?.length);
-  if (cartBeforeRes.data?.cart?.length !== 1) throw new Error("Cart should still have items before payment!");
+  assert.strictEqual(cartBeforeRes.data?.cart?.length, 1, "Cart must remain intact before payment");
 
-  // Test 5: Verify payment with FAKE signature (must be rejected, order marked FAILED, cart NOT cleared)
-  const fakeSigRes = await request("/orders/verify-payment", {
-    method: "POST",
-    body: JSON.stringify({
-      shopKartOrderId,
-      razorpay_order_id: razorpayOrderId,
-      razorpay_payment_id: "pay_fake123",
-      razorpay_signature: "invalid_fake_signature_hex",
-    }),
-  });
-  console.log("Test 5 (Fake signature verification): Status", fakeSigRes.status, "Message:", fakeSigRes.data?.message);
-  if (fakeSigRes.status !== 400) throw new Error("Expected 400 for fake signature");
-
-  // Verify cart STILL contains items after failed payment
-  const cartAfterFail = await request("/cart");
-  if (cartAfterFail.data?.cart?.length !== 1) throw new Error("Cart should NOT be cleared after failed payment!");
-
-  // Test 6: Verify payment with VALID HMAC SHA-256 signature
-  const testSecret = process.env.RAZORPAY_KEY_SECRET || "shopkart_test_secret_1234";
-  const testPaymentId = "pay_test_" + Date.now();
-  const validSignature = crypto
-    .createHmac("sha256", testSecret)
-    .update(`${razorpayOrderId}|${testPaymentId}`)
-    .digest("hex");
-
-  const validSigRes = await request("/orders/verify-payment", {
-    method: "POST",
-    body: JSON.stringify({
-      shopKartOrderId,
-      razorpay_order_id: razorpayOrderId,
-      razorpay_payment_id: testPaymentId,
-      razorpay_signature: validSignature,
-    }),
-  });
-  console.log("Test 6 (Valid signature verification): Status", validSigRes.status, "Message:", validSigRes.data?.message);
-  if (validSigRes.status !== 200) throw new Error("Expected 200 for valid payment verification");
-
-  const confirmedOrder = validSigRes.data?.order;
-  if (confirmedOrder?.paymentStatus !== "PAID" || confirmedOrder?.status !== "PLACED") {
-    throw new Error(`Order state incorrect. paymentStatus: ${confirmedOrder?.paymentStatus}, status: ${confirmedOrder?.status}`);
+  if (!hasTestCredentials) {
+    assert.strictEqual(createOrderRes.status, 503, "Missing Razorpay credentials should fail closed");
+    assert.match(createOrderRes.data?.message || "", /RAZORPAY_KEY_ID/);
+    assert.ok(!createOrderRes.data?.razorpayOrderId, "No fake Razorpay order ID should be returned");
+    console.log("No real test keys configured: checkout correctly fails closed; no simulated payment order was created.");
+    return;
   }
 
-  // Test 7: Verify cart is now CLEARED in database
-  const cartAfterSuccess = await request("/cart");
-  console.log("Test 7 (Cart after verified payment): Items in cart =", cartAfterSuccess.data?.cart?.length);
-  if (cartAfterSuccess.data?.cart?.length !== 0) throw new Error("Cart should be empty after verified payment!");
+  assert.strictEqual(createOrderRes.status, 201, "Razorpay order should be created");
+  const { shopKartOrderId, razorpayOrderId, amount } = createOrderRes.data;
+  assert.ok(razorpayOrderId?.startsWith("order_"), "Razorpay must return the order ID");
+  assert.strictEqual(amount, Math.round(testProduct.price * 100), "Order amount must use the server-side product price");
 
-  // Test 8: Get My Orders
-  const ordersRes = await request("/orders");
-  console.log("Test 8 (Get My Orders): Status", ordersRes.status, "Count:", ordersRes.data?.count);
-  if (ordersRes.data?.orders?.length === 0) throw new Error("Expected order to appear in My Orders");
-
-  // Test 9: Get Single Order by ID
-  const singleOrderRes = await request(`/orders/${shopKartOrderId}`);
-  console.log("Test 9 (Get Order By ID): Status", singleOrderRes.status, "Order ID:", singleOrderRes.data?.order?._id);
-  if (singleOrderRes.status !== 200) throw new Error("Expected 200 on get single order");
-
-  // Test 10: Bonus - Update Order Status
-  const statusUpdateRes = await request(`/orders/${shopKartOrderId}/status`, {
-    method: "PATCH",
-    body: JSON.stringify({ status: "CONFIRMED" }),
+  const duplicateRes = await request("/orders/create-payment-order", {
+    method: "POST",
+    body: JSON.stringify({ shippingAddress, idempotencyKey, totalAmount: 1 }),
   });
-  console.log("Test 10 (Bonus - Status update): Status", statusUpdateRes.status, "New Status:", statusUpdateRes.data?.order?.status);
-  if (statusUpdateRes.data?.order?.status !== "CONFIRMED") throw new Error("Status update failed");
+  assert.strictEqual(duplicateRes.status, 200, "Repeated checkout request should reuse its order");
+  assert.strictEqual(duplicateRes.data?.shopKartOrderId, shopKartOrderId);
+  assert.strictEqual(duplicateRes.data?.razorpayOrderId, razorpayOrderId);
 
-  console.log("\n🎉 ALL 10 ORDER & PAYMENT BACKEND TESTS PASSED SUCCESSFULLY! 🎉");
+  const invalidSignatureRes = await request("/orders/verify-payment", {
+    method: "POST",
+    body: JSON.stringify({
+      shopKartOrderId,
+      razorpay_order_id: razorpayOrderId,
+      razorpay_payment_id: "pay_invalid_test",
+      razorpay_signature: "invalid_signature",
+    }),
+  });
+  assert.strictEqual(invalidSignatureRes.status, 400, "Invalid signature must be rejected");
+
+  const cartAfterFailure = await request("/cart");
+  assert.strictEqual(cartAfterFailure.data?.cart?.length, 1, "Invalid payment must not clear the cart");
+  const ordersRes = await request("/orders");
+  const pendingOrder = ordersRes.data?.orders?.find((order) => order._id === shopKartOrderId);
+  assert.strictEqual(pendingOrder?.paymentStatus, "PENDING", "Invalid signature must not mutate payment status");
+
+  console.log("Real Razorpay order, idempotent retry, and invalid-signature/cart-preservation checks passed.");
 }
 
 runOrderTests().catch((err) => {

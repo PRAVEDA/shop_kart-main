@@ -11,6 +11,7 @@ import {
   AlertCircle
 } from "lucide-react";
 import { getProductById } from "../services/api";
+import { getProductImageSource, handleProductImageError } from "../services/productImages";
 import { useCart } from "../context/CartContext";
 
 const ProductDetails = () => {
@@ -182,7 +183,7 @@ const ProductDetails = () => {
         >
           <img
             id="product-detail-image"
-            src={product.image}
+            src={getProductImageSource(product.image)}
             alt={product.name}
             style={{
               width: "100%",
@@ -190,10 +191,7 @@ const ProductDetails = () => {
               maxHeight: "480px",
               objectFit: "cover",
             }}
-            onError={(e) => {
-              e.currentTarget.src =
-                "https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?auto=format&fit=crop&w=800&q=80";
-            }}
+            onError={handleProductImageError}
           />
 
           {/* Stock Overlay Tag */}

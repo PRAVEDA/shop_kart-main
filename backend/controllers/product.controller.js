@@ -156,7 +156,7 @@ const fallbackProducts = [
         createdAt: new Date("2026-01-08").toISOString()
     },
     {
-        _id: "65f00000000000000000009",
+        _id: "65f000000000000000000009",
         name: "Modern Ceramic Desk Lamp",
         description: "Contemporary Nordic style ceramic table lamp with touch-dimmable warm ambient LED light and matte stone finish.",
         price: 1499,

@@ -95,6 +95,14 @@ const orderSchema = new mongoose.Schema(
       type: String,
       default: null,
     },
+    razorpayKeyId: {
+      type: String,
+      default: null,
+    },
+    checkoutRequestId: {
+      type: String,
+      default: null,
+    },
     razorpayPaymentId: {
       type: String,
       default: null,
@@ -105,6 +113,14 @@ const orderSchema = new mongoose.Schema(
     },
   },
   { timestamps: true }
+);
+
+orderSchema.index(
+  { user: 1, checkoutRequestId: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { checkoutRequestId: { $type: "string" } },
+  }
 );
 
 module.exports = mongoose.model("Order", orderSchema);

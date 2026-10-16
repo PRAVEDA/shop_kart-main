@@ -11,6 +11,7 @@ import {
   CheckCircle2
 } from "lucide-react";
 import { getMyOrders } from "../services/api";
+import { getProductImageSource, handleProductImageError } from "../services/productImages";
 
 const Orders = () => {
   const [orders, setOrders] = useState([]);
@@ -236,11 +237,10 @@ const Orders = () => {
                             ? "rgba(16, 185, 129, 0.15)"
                             : "rgba(99, 102, 241, 0.15)",
                         color: order.status === "DELIVERED" ? "#34d399" : "#818cf8",
-                        border: `1px solid ${
-                          order.status === "DELIVERED"
+                        border: `1px solid ${order.status === "DELIVERED"
                             ? "rgba(16, 185, 129, 0.3)"
                             : "rgba(99, 102, 241, 0.3)"
-                        }`,
+                          }`,
                       }}
                     >
                       {order.status}
@@ -258,11 +258,10 @@ const Orders = () => {
                             ? "rgba(16, 185, 129, 0.1)"
                             : "rgba(239, 68, 68, 0.1)",
                         color: order.paymentStatus === "PAID" ? "#34d399" : "#f87171",
-                        border: `1px solid ${
-                          order.paymentStatus === "PAID"
+                        border: `1px solid ${order.paymentStatus === "PAID"
                             ? "rgba(16, 185, 129, 0.25)"
                             : "rgba(239, 68, 68, 0.25)"
-                        }`,
+                          }`,
                       }}
                     >
                       {order.paymentStatus}
@@ -297,9 +296,10 @@ const Orders = () => {
                         title={`${it.name} (Qty: ${it.quantity})`}
                       >
                         <img
-                          src={it.image || "https://images.unsplash.com/photo-1523275335684-37898b6baf30"}
+                          src={getProductImageSource(it.image)}
                           alt={it.name}
                           style={{ width: "100%", height: "100%", objectFit: "cover" }}
+                          onError={handleProductImageError}
                         />
                         {it.quantity > 1 && (
                           <span

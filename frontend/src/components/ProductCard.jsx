@@ -2,6 +2,7 @@ import React, { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { Eye, Tag, Heart, ShoppingCart, AlertCircle, Plus } from "lucide-react";
 import { toggleWishlist } from "../services/api";
+import { getProductImageSource, handleProductImageError } from "../services/productImages";
 import { useCart } from "../context/CartContext";
 
 const ProductCard = ({ product, isInitiallyWishlisted = false, onWishlistChange }) => {
@@ -94,22 +95,23 @@ const ProductCard = ({ product, isInitiallyWishlisted = false, onWishlistChange 
     >
       {/* Product Image Container */}
       <div
+        className="product-image-frame"
         style={{
           position: "relative",
           width: "100%",
-          paddingTop: "70%",
+          aspectRatio: "10 / 7",
           overflow: "hidden",
           backgroundColor: "rgba(15, 23, 42, 0.6)",
         }}
       >
         <img
-          src={product.image}
+          className="product-card-image"
+          src={getProductImageSource(product.image)}
           alt={product.name}
           loading="lazy"
           style={{
-            position: "absolute",
-            top: 0,
-            left: 0,
+            position: "relative",
+            display: "block",
             width: "100%",
             height: "100%",
             objectFit: "cover",
@@ -117,10 +119,7 @@ const ProductCard = ({ product, isInitiallyWishlisted = false, onWishlistChange 
           }}
           onMouseOver={(e) => (e.currentTarget.style.transform = "scale(1.06)")}
           onMouseOut={(e) => (e.currentTarget.style.transform = "scale(1)")}
-          onError={(e) => {
-            e.currentTarget.src =
-              "https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?auto=format&fit=crop&w=800&q=80";
-          }}
+          onError={handleProductImageError}
         />
 
         {/* Category Pill Tag */}
@@ -189,8 +188,8 @@ const ProductCard = ({ product, isInitiallyWishlisted = false, onWishlistChange 
             background: isOutOfStock
               ? "rgba(239, 68, 68, 0.85)"
               : isLowStock
-              ? "rgba(245, 158, 11, 0.85)"
-              : "rgba(16, 185, 129, 0.85)",
+                ? "rgba(245, 158, 11, 0.85)"
+                : "rgba(16, 185, 129, 0.85)",
             backdropFilter: "blur(8px)",
             WebkitBackdropFilter: "blur(8px)",
             color: "#ffffff",
@@ -300,17 +299,17 @@ const ProductCard = ({ product, isInitiallyWishlisted = false, onWishlistChange 
               background: isAtMaxStock
                 ? "rgba(100, 116, 139, 0.4)"
                 : cartQty > 0
-                ? "linear-gradient(135deg, #10b981 0%, #059669 100%)"
-                : "linear-gradient(135deg, var(--primary) 0%, var(--primary-hover) 100%)",
+                  ? "linear-gradient(135deg, #10b981 0%, #059669 100%)"
+                  : "linear-gradient(135deg, var(--primary) 0%, var(--primary-hover) 100%)",
             }}
             title={
               isOutOfStock
                 ? "Out of stock"
                 : isAtMaxStock
-                ? "Max stock already in cart"
-                : cartQty > 0
-                ? "Add another unit"
-                : "Add product to cart"
+                  ? "Max stock already in cart"
+                  : cartQty > 0
+                    ? "Add another unit"
+                    : "Add product to cart"
             }
           >
             {addingToCart ? (

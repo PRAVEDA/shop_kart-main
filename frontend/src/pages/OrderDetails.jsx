@@ -14,6 +14,7 @@ import {
   AlertCircle
 } from "lucide-react";
 import { getOrderById, updateOrderStatus } from "../services/api";
+import { getProductImageSource, handleProductImageError } from "../services/productImages";
 
 const STATUS_STEPS = ["PLACED", "CONFIRMED", "SHIPPED", "DELIVERED"];
 
@@ -217,11 +218,10 @@ const OrderDetails = () => {
                       ? "rgba(16, 185, 129, 0.15)"
                       : "rgba(99, 102, 241, 0.15)",
                   color: order.status === "DELIVERED" ? "#34d399" : "#818cf8",
-                  border: `1px solid ${
-                    order.status === "DELIVERED"
+                  border: `1px solid ${order.status === "DELIVERED"
                       ? "rgba(16, 185, 129, 0.3)"
                       : "rgba(99, 102, 241, 0.3)"
-                  }`,
+                    }`,
                 }}
               >
                 {order.status}
@@ -400,9 +400,10 @@ const OrderDetails = () => {
                       }}
                     >
                       <img
-                        src={item.image || "https://images.unsplash.com/photo-1523275335684-37898b6baf30"}
+                        src={getProductImageSource(item.image)}
                         alt={item.name}
                         style={{ width: "100%", height: "100%", objectFit: "cover" }}
+                        onError={handleProductImageError}
                       />
                     </div>
                     <div>
