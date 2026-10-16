@@ -1,0 +1,4 @@
+.kilo/
+.env
+.env.*
+node_modules/
